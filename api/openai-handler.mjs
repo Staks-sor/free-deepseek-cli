@@ -1,3 +1,4 @@
+import fs from 'fs';
 // Прототип OpenAI-совместимого /v1/chat/completions.
 //
 // Поддерживает:
@@ -125,6 +126,7 @@ Example:
 \`\`\`
 DO NOT output just "command: ...". You MUST use the exact JSON structure and markdown block above.
 If you need to output text to the user, you can just write normal text. If you want to use tools, write the tool block.
+IMPORTANT: Never insert conversational text (like "Now let me look...") INSIDE the JSON array. Keep JSON valid.
 
 Available tools:
 ${JSON.stringify(body.tools, null, 2)}
@@ -421,7 +423,13 @@ class StreamParser {
       let jsonStr = this.toolsBuffer;
       
       const firstBracket = jsonStr.indexOf("[");
-      const lastBracket = jsonStr.lastIndexOf("]");
+      let lastBracket = jsonStr.indexOf("```");
+      if (lastBracket !== -1) {
+        jsonStr = jsonStr.slice(0, lastBracket);
+        lastBracket = jsonStr.lastIndexOf("]");
+      } else {
+        lastBracket = jsonStr.lastIndexOf("]");
+      }
       
       if (firstBracket !== -1 && lastBracket !== -1 && lastBracket >= firstBracket) {
         jsonStr = jsonStr.slice(firstBracket, lastBracket + 1);
@@ -429,7 +437,11 @@ class StreamParser {
         // Fallback cleanup if brackets are missing
         jsonStr = jsonStr.replace(/```\s*$/, "").trim();
         if (!jsonStr.startsWith("[")) jsonStr = "[" + jsonStr;
-        if (!jsonStr.endsWith("]")) jsonStr = jsonStr + "]";
+        // if model stream ended abruptly, it might not have ]
+        if (!jsonStr.endsWith("]")) {
+           if (jsonStr.endsWith("}")) jsonStr = jsonStr + "]";
+           else jsonStr = jsonStr + "}]";
+        }
       }
       
       // Some models (DeepSeek Reasoner) drop random text inside the markdown block
@@ -441,7 +453,16 @@ class StreamParser {
       // We will try to parse it, and if it fails, try some aggressive cleanup.
       try {
         // Try strict parsing first, then fallback to safe newline escaping
-        let strictJson = jsonStr.replace(/\\n/g, "\\\\n").replace(/\n/g, "\\n").replace(/\r/g, "");
+        // strictJson removes unescaped newlines safely using negative lookbehind so we don't break already escaped ones
+        // Replace newlines ONLY inside double quotes
+        let strictJson = jsonStr.replace(/"(?:[^"\\]|\\.)*"/g, match => match.replace(/\n/g, "\\n").replace(/\r/g, ""));
+        // Strict JSON might fail if the model put text inside the array before the last bracket
+        // Let's remove any text between } and ] or } and { that is not a comma
+        strictJson = strictJson.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '');
+        strictJson = strictJson.replace(/<environment_details>[\s\S]*/, '');
+        strictJson = strictJson.replace(/}\s*[^,\]\{\[\}"]+\s*\]$/, '}]');
+        strictJson = strictJson.replace(/}\s*[^,\]\{\[\}"]+\s*{/g, '}, {');
+        
         let calls = JSON.parse(strictJson);
         if (!Array.isArray(calls)) calls = [calls];
         
@@ -472,8 +493,8 @@ class StreamParser {
           fixedJson = fixedJson.replace(/\][^\[]*\[/g, '],['); // remove any text between arrays
           
           if (fixedJson.includes('],[')) {
-            if (!fixedJson.startsWith('[')) fixedJson = '[' + fixedJson;
-            if (!fixedJson.endsWith(']')) fixedJson = fixedJson + ']';
+            if (!fixedJson.startsWith('[[')) fixedJson = '[' + fixedJson;
+            if (!fixedJson.endsWith(']]')) fixedJson = fixedJson + ']';
           }
 
           if (fixedJson.startsWith('[\n') || fixedJson.startsWith('[')) {
@@ -489,12 +510,26 @@ class StreamParser {
           // If we see [ "name" we can replace it with [ {"name"
           fixedJson = fixedJson.replace(/\[\s*"name"/g, '[ {"name"');
           // If it ends with string or number and then ], it needs closing brace
-          // fixedJson = fixedJson.replace(/(["\da-zA-Z])\s*\]$/, '$1}]');
+          fixedJson = fixedJson.replace(/(["\da-zA-Z])\s*\]$/, '$1}]');
+
+          // DeepSeek Reasoner might insert literal text inside the array, like:
+          // [ { ... } Now let me look at the dependencies... ]
+          // This completely breaks JSON. Let's try to remove any text between } and ]
+          // Also it inserts things like <environment_details>...
+          fixedJson = fixedJson.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '');
+          // Or sometimes just the opening tag with no closing...
+          fixedJson = fixedJson.replace(/<environment_details>[\s\S]*/, '');
+          fixedJson = fixedJson.replace(/}\s*[^,\]\{\[\}"]+\s*\]$/, '}]');
+          fixedJson = fixedJson.replace(/}\s*[^,\]\{\[\}"]+\s*{/g, '}, {');
 
           // Reasoner may put literal unescaped newlines in content which causes JSON.parse to fail.
           // We can replace them with \n using a safe function
-          fixedJson = fixedJson.replace(/\\n/g, "\\\\n"); // double escape already escaped newlines
-          fixedJson = fixedJson.replace(/\n/g, "\\n").replace(/\r/g, ""); // escape literal newlines
+          // NOTE: We should NOT replace newlines that are already escaped, e.g. \\n.
+          // Wait, if it's literal \n inside string, replacing with \\n will make JSON parse it as \n.
+          // If the model truncated and just put `}]` at the end without closing the string, fix it:
+          fixedJson = fixedJson.replace(/([^"])\}\]$/, '$1"}}]');
+
+          fixedJson = fixedJson.replace(/"(?:[^"\\]|\\.)*"/g, match => match.replace(/\n/g, "\\n").replace(/\r/g, "")); // escape literal newlines in strings
 
           // One more bug with DeepSeek Reasoner: it might use double arrays like [[{...}]] due to our wrapping above.
           // JSON.parse will handle it, and flat(Infinity) will flatten it.
@@ -521,7 +556,7 @@ class StreamParser {
           });
         } catch (e2) {
           console.error("[API] Error parsing tool calls from streaming response:", e2.message);
-          console.error("[API] Problematic JSON string was:\n", jsonStr);
+          fs.writeFileSync("/tmp/failed_json.txt", jsonStr); console.error("[API] Problematic JSON string was:\n", JSON.stringify(jsonStr));
           // Fallback: send as normal text so the UI doesn't hang completely
           this.sendChunk({ content: "\n[Error parsing tool call JSON from model]\n" + jsonStr });
         }
