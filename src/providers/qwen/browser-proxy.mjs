@@ -16,9 +16,20 @@
 //
 // Lifecycle: ленивый launch на первом вызове, держим контекст до закрытия процесса.
 
-import { QWEN_BASE_URL, QWEN_BROWSER_PROFILE } from "./config.mjs";
+import { QWEN_AUTH_FILE, QWEN_BASE_URL, QWEN_BROWSER_PROFILE } from "./config.mjs";
+import { applyQwenCookiesToContext, readQwenAuth } from "./auth-files.mjs";
 
 let proxyPromise = null;
+
+// Сброс singleton после re-login / refresh — следующий запрос поднимет прокси с новыми куками.
+export function resetQwenBrowserProxy() {
+  if (proxyPromise) {
+    proxyPromise
+      .then((proxy) => proxy.close?.())
+      .catch(() => {});
+  }
+  proxyPromise = null;
+}
 
 // Возвращает singleton-инстанс прокси. Все вызовы делят один Chromium.
 export function getQwenBrowserProxy({ debug = false } = {}) {
@@ -61,6 +72,13 @@ async function createProxy({ debug }) {
   });
 
   const page = context.pages()[0] || (await context.newPage());
+
+  // auth.json может быть свежее профиля (import-qwen, silent refresh). Подмешиваем куки до goto.
+  const savedAuth = readQwenAuth(QWEN_AUTH_FILE);
+  if (savedAuth?.cookies?.length) {
+    const n = await applyQwenCookiesToContext(context, savedAuth.cookies);
+    if (debug) console.log(`[qwen-proxy] injected ${n} cookies from auth.json`);
+  }
 
   if (debug) {
     // Фильтр шума: console.groupEnd с именем «Error» из Qwen-овского JS (это

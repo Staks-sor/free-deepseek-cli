@@ -62,3 +62,34 @@ export function qwenCookieHeaderFromArray(parsed) {
   const usable = parsed.filter((cookie) => cookie?.name && "value" in cookie);
   return usable.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
 }
+
+// Playwright addCookies() ожидает объекты с domain/path. Нормализуем сохранённые куки.
+export function playwrightCookiesFromSaved(cookies) {
+  if (!Array.isArray(cookies)) return [];
+  return cookies
+    .filter((c) => c?.name && "value" in c)
+    .map((c) => {
+      const entry = {
+        name: String(c.name),
+        value: String(c.value),
+        domain: String(c.domain || ".qwen.ai"),
+        path: String(c.path || "/"),
+        httpOnly: Boolean(c.httpOnly),
+        secure: Boolean(c.secure),
+        sameSite: c.sameSite || "Lax",
+      };
+      if (typeof c.expires === "number" && c.expires > 0) {
+        entry.expires = c.expires;
+      }
+      return entry;
+    });
+}
+
+// Подмешать куки из auth.json в Chromium-контекст (browser-proxy / refresh).
+// Без этого import-qwen и рассинхрон профиля с auth.json ломают «авто»-вход.
+export async function applyQwenCookiesToContext(context, cookies) {
+  const normalized = playwrightCookiesFromSaved(cookies);
+  if (!normalized.length) return 0;
+  await context.addCookies(normalized);
+  return normalized.length;
+}

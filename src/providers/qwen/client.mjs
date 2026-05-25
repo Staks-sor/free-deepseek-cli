@@ -15,7 +15,17 @@ import os from "node:os";
 import path from "node:path";
 import { QWEN_BASE_URL, QWEN_DEFAULT_MODEL } from "./config.mjs";
 import { qwenBaseHeaders } from "./headers.mjs";
+import { isQwenAuthError } from "./auth-manager.mjs";
 import { getQwenBrowserProxy } from "./browser-proxy.mjs";
+
+function throwIfQwenAuthFailure(status, text, context) {
+  const snippet = String(text || "").slice(0, 800);
+  const err = new Error(`Qwen ${context} failed: HTTP ${status}: ${snippet}`);
+  if (status === 401 || status === 403 || isQwenAuthError(err)) {
+    err.isAuthError = true;
+  }
+  throw err;
+}
 
 // Через какой путь шлём запросы:
 //  - "browser" (по умолчанию) — через невидимый Playwright. Запросы автоматически
@@ -76,7 +86,7 @@ export class QwenChatClient {
     // chatId: null — навигировать никуда не нужно, остаёмся на главной.
     const result = await proxy.proxyFetch({ url, body, chatId: null });
     if (!result.ok) {
-      throw new Error(`Qwen createChat failed: HTTP ${result.status}: ${(result.text || "").slice(0, 500)}`);
+      throwIfQwenAuthFailure(result.status, result.text, "createChat");
     }
 
     let json;
@@ -197,7 +207,7 @@ export class QwenChatClient {
       }
 
       if (!result.ok) {
-        throw new Error(`Qwen completion failed (browser): HTTP ${result.status}: ${(result.text || "").slice(0, 800)}`);
+        throwIfQwenAuthFailure(result.status, result.text, "completion (browser)");
       }
 
       return parseQwenResponseText(result.text, result.contentType, onText);
@@ -208,7 +218,7 @@ export class QwenChatClient {
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`Qwen completion failed: HTTP ${res.status}: ${text.slice(0, 800)}`);
+      throwIfQwenAuthFailure(res.status, text, "completion");
     }
 
     const contentType = String(res.headers.get("content-type") || "");

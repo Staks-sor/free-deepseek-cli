@@ -18,15 +18,18 @@
 
 ---
 
-Архитектурно проект разделён на модули в `src/` (22 файла по доменам: auth, browser, deepseek, code-agent, state, window-app, cli). Точка входа — `bin/deepseek.mjs`. Юнит-тесты: `npm test` (91 кейс, встроенный Node test runner). Подробности — [REFACTOR_NOTES.md](REFACTOR_NOTES.md).
+Архитектурно проект разделён на модули в `src/` (auth, browser, deepseek, providers/qwen, code-agent, state, window-app, api, cli). Точка входа — `bin/deepseek.mjs`. Юнит-тесты: `npm test` (97 кейсов, встроенный Node test runner). Подробности — [REFACTOR_NOTES.md](REFACTOR_NOTES.md).
 
 ## Что внутри
 
-- **Авто-логин:** один раз заходишь через настоящий браузер (Google OAuth / email-пароль / captcha — что угодно). Дальше токен подхватывается из сохранённого профиля Chromium неделями, без повторных логинов.
+- **Два провайдера:** DeepSeek (`chat.deepseek.com`) и Qwen (`chat.qwen.ai`) — в одном окне чатов, переключение при создании беседы.
+- **Авто-логин DeepSeek:** один раз заходишь через браузер (Google OAuth / email-пароль / captcha). Дальше сессия подхватывается из Chromium-профиля; при протухании — тихий refresh или окно re-login.
+- **Авто-логин Qwen:** отдельный профиль и `auth.json`; тихий refresh из профиля, re-login из UI («нажми — подключить») или `npm run login-qwen`.
 - **Окно чатов** (`localhost:4317`): несколько параллельных бесед, каждая привязана к своей папке-проекту.
 - **CLI-режим:** REPL в терминале для скриптовых сценариев и быстрых вопросов.
-- **`/code` агент:** даёт DeepSeek доступ к файлам в папке проекта (read/write) и к whitelist-набору команд (`node`, `npm`, `python`, `git`, ... — настраивается в UI).
-- **Файловый браузер:** при создании чата можно открыть проводник, выбрать существующую папку или создать новую.
+- **`/code` агент:** доступ к файлам workspace и whitelist-командам (DeepSeek и Qwen).
+- **OpenAI-совместимый API** (`localhost:4318`): для Kilo Code, Continue и других IDE.
+- **Файловый браузер:** при создании чата можно открыть проводник, выбрать папку или создать новую.
 
 ---
 
@@ -84,48 +87,106 @@ npm start
 
 Что произойдёт:
 
-1. Откроется окно DeepSeek с формой логина.
-2. Заходишь любым способом — Google OAuth, email/пароль, captcha. Делаешь это руками **один раз**.
-3. CLI ловит факт логина по сетевому сигналу (первый `Authorization: Bearer` запрос с `200 OK`) и закрывает окно.
-4. Сохраняет cookies + токен в `~/.deepseek-cli/auth.json`.
-5. Открывает рабочее окно (`localhost:4317`) — интерфейс чатов с формой ввода.
+1. Если **ни один провайдер** ещё не подключён — консольный welcome-экран: выбери `1` (DeepSeek), `2` (Qwen) или `1,2` (оба).
+2. Для каждого выбранного провайдера откроется окно логина в Chrome/Chromium — зайди **один раз** (Google OAuth, email/пароль, captcha).
+3. **DeepSeek:** окно закроется само после первого успешного API-запроса; сессия → `~/.deepseek-cli/`.
+4. **Qwen:** окно закроется, когда в cookies появится JWT (`token`); сессия → `~/.qwen-cli/`.
+5. Откроется рабочее окно чатов (`localhost:4317`).
 
-Дальше пользоваться можно просто так — `npm start` каждый день.
+Повторный запуск — `npm start` без welcome, если auth уже есть. Qwen можно добавить позже: **«+ New chat»** → Qwen → **«нажми — подключить»**.
 
 ---
 
 ## Где что хранится
 
-Все служебные файлы лежат в одной папке, вне проекта:
+Служебные файлы — вне проекта, в домашней папке пользователя.
+
+**DeepSeek** (`~/.deepseek-cli/` на Unix, `%USERPROFILE%\.deepseek-cli\` на Windows):
 
 ```
 ~/.deepseek-cli/
 ├── auth.json              # cookies + userToken (mode 0600 на Unix)
-├── browser-profile/       # Chromium-профиль с Google-сессией
-├── state.json             # ВСЕ чаты со всех проектов (глобально)
-├── state.backup.json      # одна резервная копия
+├── browser-profile/       # Chromium-профиль с сессией DeepSeek
+├── state.json             # все чаты (глобально)
+├── state.backup.json
 ├── settings.json          # allow-list команд для /code
-└── credentials.json       # email + пароль (если включил auto-login)
+└── credentials.json       # email + пароль (опционально, только DeepSeek)
 ```
 
-На **Windows** это `C:\Users\<user>\.deepseek-cli\`. На Unix — `~/.deepseek-cli/`. Программа знает оба пути сама через `os.homedir()`.
+**Qwen** (отдельно, не смешивается с DeepSeek):
+
+```
+~/.qwen-cli/
+├── auth.json              # cookies + JWT token
+└── browser-profile/       # Chromium-профиль для chat.qwen.ai и browser-proxy
+```
+
+Чаты и настройки `/code` — только в `~/.deepseek-cli/state.json` (общие для всех провайдеров).
 
 ---
 
 ## Команды npm
 
-| Команда                  | Что делает                                                                 |
-|--------------------------|----------------------------------------------------------------------------|
-| `npm start`              | Запускает окно чатов (`--window`). Открывает auth-окно, если надо.         |
-| `npm run window`         | Алиас `npm start`.                                                          |
-| `npm run cli`            | Терминальный REPL вместо окна. Те же команды `/code`, `/ls`, `/new` и т.д.|
-| `npm run check`          | Проверяет, что auth жив. Должен ответить `OK: authenticated`.              |
-| `npm run login`          | Принудительно открыть окно логина и перезаписать `auth.json`.              |
-| `npm run save-creds`     | Сохранить email + пароль (для авто-заполнения формы при re-login).         |
+| Команда | Что делает |
+|---------|------------|
+| `npm start` | Окно чатов (`localhost:4317`). Welcome + логин, если провайдер не подключён. |
+| `npm run window` | Алиас `npm start`. |
+| `npm run cli` | Терминальный REPL (`/code`, `/ls`, `/new`, …). |
+| `npm run welcome` | Снова показать выбор провайдеров и подключить новые. |
+| `npm run check` | Проверка auth DeepSeek (`OK: authenticated`). |
+| `npm run login` | Re-login DeepSeek → `~/.deepseek-cli/auth.json`. |
+| `npm run login-qwen` | Re-login Qwen → `~/.qwen-cli/auth.json`. |
+| `npm run import-qwen` | Импорт cookies из JSON (Chrome / Cookie Editor), без Playwright. |
+| `npm run save-creds` | Email + пароль для авто-заполнения формы DeepSeek. |
+| `npm test` | Юнит-тесты (97 кейсов). |
+
+Запуск OpenAI-совместимого API (отдельный процесс):
+
+```bash
+node api/server.mjs
+# → http://127.0.0.1:4318/v1
+```
 
 ---
 
-## Авто-логин email/пароль (опционально)
+## Подключение Qwen
+
+Qwen использует **отдельный** Chromium-профиль и API через встроенный browser-proxy (подпись `bx-ua` на стороне chat.qwen.ai). Без логина Qwen в чатах не появится.
+
+### Способ 1 — из окна чатов (рекомендуется)
+
+1. `npm start`
+2. **«+ New chat»** → провайдер **Qwen**
+3. Если подпись «нажми — подключить» — клик по карточке Qwen
+4. Подтверди диалог → откроется `chat.qwen.ai` → залогинься → окно закроется само
+
+### Способ 2 — из терминала
+
+```bash
+npm run login-qwen
+```
+
+### Способ 3 — импорт cookies (если Playwright блокирует антибот)
+
+1. Залогинься в **обычном Chrome** на [chat.qwen.ai](https://chat.qwen.ai)
+2. Экспортируй cookies расширением (Cookie Editor, EditThisCookie) в JSON
+3. Импорт:
+
+```bash
+npm run import-qwen -- /path/to/cookies.json
+```
+
+Куки попадут и в `auth.json`, и в `browser-profile` — API и окно чатов увидят одну сессию.
+
+### Авто-обновление сессии
+
+Как у DeepSeek: при протухшей сессии программа сначала пробует **тихий refresh** из `~/.qwen-cli/browser-profile` (без окна). Если не вышло — открывает окно логина. В окне чатов и в API (`node api/server.mjs`) это встроено.
+
+Перед Qwen-чатом нужен хотя бы один успешный `login-qwen` или импорт — иначе нечего обновлять.
+
+---
+
+## Авто-логин email/пароль (только DeepSeek, опционально)
 
 Если у тебя обычный email-вход (не Google OAuth) и хочется полный автомат:
 
@@ -212,7 +273,25 @@ npm run save-creds
 
 **Окно открылось, но `chat.deepseek.com` показывает ошибки** → попробуй обновить страницу. Если не помогло — ядерный сброс.
 
-**Сессия истекла, окно re-login не открывается** → запусти `npm run login` руками.
+**Сессия истекла, окно re-login не открывается** → `npm run login` (DeepSeek) или `npm run login-qwen` (Qwen).
+
+### Qwen
+
+| Симптом | Что делать |
+|---------|------------|
+| В «Новый чат» Qwen серый / «не подключён» | Клик по Qwen → «подключить», или `npm run login-qwen` |
+| `Qwen не подключён` в чате | То же + проверь `~/.qwen-cli/auth.json` |
+| Окно логина закрылось, JWT не появился | Антибот: `npm run import-qwen -- cookies.json` из Chrome |
+| Ответы пустые / Bad_Request | Не ставь `QWEN_TRANSPORT=direct` в `.env` — нужен режим `browser` (по умолчанию) |
+| После `import-qwen` всё равно не работает | Обнови репо (`git pull`), перезапусти `npm start` — куки синхронизируются в профиль |
+| Сессия была, потом отвалилась | Обычно помогает тихий refresh; иначе `npm run login-qwen` |
+
+Ядерный сброс только Qwen (DeepSeek не трогает):
+
+```bash
+rm -rf ~/.qwen-cli
+npm run login-qwen
+```
 
 ---
 
@@ -230,23 +309,32 @@ node api/server.mjs
 
 ### Настройка в Kilo Code
 
-1. Откройте настройки провайдера в Kilo Code
-2. Добавьте **OpenAI-совместимый провайдер** со следующими параметрами:
+1. Подключи провайдеров в CLI: `npm run login` и/или `npm run login-qwen`
+2. Запусти API: `node api/server.mjs`
+3. В Kilo Code — **OpenAI-совместимый провайдер**:
    - **Base URL:** `http://127.0.0.1:4318/v1`
    - **API Key:** любой (проверка отключена)
-   - **Модели:** `qwen3.6-plus`, `deepseek-reasoner`, `deepseek-chat`
+   - **Модели:** см. `GET http://127.0.0.1:4318/v1/models`
 
-Готово — Kilo Code будет отправлять запросы к вашему локальному серверу.
+| Имя в Kilo Code | Провайдер |
+|-----------------|-----------|
+| `deepseek-chat` | DeepSeek, обычный чат |
+| `deepseek-reasoner` | DeepSeek R1 (reasoner) |
+| `qwen3.6-plus`, `qwen3-max`, … | Qwen |
+
+**Важно:** в настройках Kilo указывай именно эти id — не подставляй `deepseek-reasoner` вручную в другие поля. Сервер сам маппит `deepseek-reasoner` → `model_type: expert` у DeepSeek.
+
+При ошибке `unknown variant 'deepseek-reasoner'` — обнови репозиторий (`git pull`) и перезапусти `node api/server.mjs` (нужна актуальная `api/models.mjs`).
 
 ---
 
 ## Безопасность (краткое резюме)
 
-- `userToken` хранится в `~/.deepseek-cli/auth.json` plaintext, права `0o600` на Unix. На Windows защищён ACL юзера.
-- `credentials.json` (email + пароль, если включил) — то же самое. **Не используй для DeepSeek тот же пароль, что для важных сервисов** (банк, основная почта).
-- `/code` запускает команды **без shell**, в пределах workspace, с whitelist. Сетевые команды (`curl`, `wget`) и shell (`bash`, `sh`) заблокированы по умолчанию — это сознательно.
-- HTTP-сервер биндится только на `127.0.0.1` — снаружи недоступен.
-- Chromium-профиль (`~/.deepseek-cli/browser-profile/`) полностью контролируется только тобой — никакие другие сайты в этот профиль не лезут (его открывает только Playwright по запросу программы).
+- Токены и cookies — в `~/.deepseek-cli/` и `~/.qwen-cli/` (plaintext, `0o600` на Unix, ACL на Windows).
+- `credentials.json` — только DeepSeek, опционально. **Не используй тот же пароль, что для банка/почты.**
+- `/code` — команды без shell, в пределах workspace, whitelist. `curl`/`wget`/`bash` заблокированы по умолчанию.
+- Серверы чатов и API слушают только `127.0.0.1` (`4317`, `4318`).
+- Chromium-профили DeepSeek и Qwen **разделены** — сессии не смешиваются; открывает только Playwright по запросу программы.
 
 ---
 

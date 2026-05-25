@@ -27,7 +27,11 @@ import {
   QWEN_REQUIRED_COOKIES,
   QWEN_TOKEN_COOKIE_NAME,
 } from "./config.mjs";
-import { qwenCookieHeaderFromArray, writeQwenAuth } from "./auth-files.mjs";
+import {
+  applyQwenCookiesToContext,
+  qwenCookieHeaderFromArray,
+  writeQwenAuth,
+} from "./auth-files.mjs";
 
 // Импорт куки из JSON-файла, экспортированного из обычного Chrome
 // (расширения "Cookie Editor", "EditThisCookie", и т.п.).
@@ -94,12 +98,22 @@ export async function importQwenFromJson(jsonPath, authFile = QWEN_AUTH_FILE) {
     qwenCookies.find((c) => c.name === "aui")?.value ||
     "";
 
+  const profileDir = QWEN_BROWSER_PROFILE;
   writeQwenAuth(authFile, {
     cookies: normalized,
     token: tokenCookie.value,
     userId,
-    profileDir: null, // профиля нет — мы импортировали из чужого Chrome
+    profileDir,
   });
+
+  // Синхронизируем куки в persistent-профиль — иначе browser-proxy не увидит сессию.
+  try {
+    await syncQwenCookiesToProfile(normalized, profileDir);
+    console.log(`🔄 Cookies synced to browser profile (${profileDir})`);
+  } catch (error) {
+    console.warn(`⚠️ Could not sync cookies to profile: ${error.message}`);
+    console.warn("   API через browser-transport может не работать до npm run login-qwen.");
+  }
 
   console.log(`✅ Imported ${normalized.length} Qwen cookies (token: ${tokenCookie.value.slice(0, 24)}...)`);
   console.log(`💾 Saved to ${authFile}`);
@@ -210,4 +224,73 @@ async function waitForQwenToken(context, { timeoutMs = 5 * 60 * 1000, intervalMs
   throw new Error(
     `Qwen login timeout (${Math.round(timeoutMs / 1000)}s). Не дождались валидного JWT в куках. Попробуй снова.`,
   );
+}
+
+// Считать JWT и куки из уже открытого контекста (после goto на chat.qwen.ai).
+async function captureQwenAuthFromContext(context, authFile, profileDir) {
+  const cookies = await context.cookies(QWEN_BASE_URL);
+  const tokenCookie = cookies.find((c) => c.name === QWEN_TOKEN_COOKIE_NAME);
+  const token = tokenCookie?.value || "";
+  const looksLikeJwt = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token);
+
+  if (!looksLikeJwt) {
+    throw new Error(
+      "В профиле Qwen нет валидного JWT (cookie token). Залогинься: npm run login-qwen",
+    );
+  }
+
+  const userId =
+    cookies.find((c) => c.name === "cnaui")?.value ||
+    cookies.find((c) => c.name === "aui")?.value ||
+    "";
+
+  writeQwenAuth(authFile, { cookies, token, userId, profileDir });
+  return {
+    token,
+    userId,
+    cookieHeader: qwenCookieHeaderFromArray(cookies),
+    cookies,
+    source: authFile,
+  };
+}
+
+// Тихий refresh: headless Chromium с тем же профилем, что при login-qwen.
+// Если Google-сессия в профиле жива — обновляем auth.json без окна.
+export async function refreshQwenAuthFromProfile(authFile = QWEN_AUTH_FILE) {
+  if (!fs.existsSync(authFile)) {
+    throw new Error(`Qwen auth file not found: ${authFile}`);
+  }
+
+  let profileDir = QWEN_BROWSER_PROFILE;
+  try {
+    const saved = JSON.parse(fs.readFileSync(authFile, "utf8"));
+    if (saved?.profileDir) profileDir = saved.profileDir;
+  } catch {
+    // используем дефолтный профиль
+  }
+
+  const { chromium } = await import("playwright");
+  const context = await launchPersistentDeepSeekContext(chromium, profileDir, true);
+  try {
+    const page = context.pages()[0] || (await context.newPage());
+    await page.goto(QWEN_BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(2000);
+    return await captureQwenAuthFromContext(context, authFile, profileDir);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+// Записать импортированные/обновлённые куки в persistent-профиль для browser-proxy.
+export async function syncQwenCookiesToProfile(cookies, profileDir = QWEN_BROWSER_PROFILE) {
+  const { chromium } = await import("playwright");
+  const context = await launchPersistentDeepSeekContext(chromium, profileDir, true);
+  try {
+    await applyQwenCookiesToContext(context, cookies);
+    const page = context.pages()[0] || (await context.newPage());
+    await page.goto(QWEN_BASE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(1500);
+  } finally {
+    await context.close().catch(() => {});
+  }
 }

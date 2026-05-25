@@ -20,24 +20,63 @@ import { renderWindowHtml } from "./ui-html.mjs";
 export async function runWindowApp({ client, workspaceRoot, port, modelType, thinkingEnabled, searchEnabled }) {
   const state = loadWindowState(workspaceRoot);
 
-  // Lazy init Qwen-клиента. Создаём один раз, переиспользуем для всех Qwen-чатов.
-  // Если auth Qwen нет — бросаем понятную ошибку.
+  // Lazy init Qwen-клиента + авто-relogin (как DeepSeek AuthManager).
   let qwenClient = null;
-  async function getOrCreateQwenClient() {
-    if (qwenClient) return qwenClient;
-    const { QWEN_AUTH_FILE } = await import("../providers/qwen/config.mjs");
-    const { readQwenAuth } = await import("../providers/qwen/auth-files.mjs");
-    const auth = readQwenAuth(QWEN_AUTH_FILE);
-    if (!auth?.token) {
-      throw new Error("Qwen не подключён. Запусти: npm run welcome или npm run login-qwen.");
+  let qwenAuthManager = null;
+
+  async function getQwenAuthManager() {
+    if (!qwenAuthManager) {
+      const { getQwenAuthManager: factory } = await import("../providers/qwen/auth-manager.mjs");
+      qwenAuthManager = factory({ autoVisible: true });
     }
+    return qwenAuthManager;
+  }
+
+  async function buildQwenClientFromAuth(auth) {
     const { QwenChatClient } = await import("../providers/qwen/client.mjs");
-    qwenClient = new QwenChatClient({
+    return new QwenChatClient({
       token: auth.token,
       cookieHeader: auth.cookieHeader,
       debug: Boolean(process.env.DEEPSEEK_DEBUG_QWEN),
     });
+  }
+
+  // Гарантирует валидный auth: тихий refresh из профиля → окно логина.
+  async function ensureQwenAuth({ forceVisible = false } = {}) {
+    const { QWEN_AUTH_FILE } = await import("../providers/qwen/config.mjs");
+    const { readQwenAuth } = await import("../providers/qwen/auth-files.mjs");
+    const existing = readQwenAuth(QWEN_AUTH_FILE);
+    if (existing?.token && !forceVisible) {
+      return existing;
+    }
+    const manager = await getQwenAuthManager();
+    return manager.refresh({ forceVisible: forceVisible || !existing?.token });
+  }
+
+  async function getOrCreateQwenClient({ forceRebuild = false } = {}) {
+    if (qwenClient && !forceRebuild) return qwenClient;
+    const auth = await ensureQwenAuth();
+    qwenClient = await buildQwenClientFromAuth(auth);
     return qwenClient;
+  }
+
+  // Вызов Qwen API с авто-refresh сессии при auth-ошибке (до 2 попыток).
+  async function qwenApiCall(fn) {
+    const { isQwenAuthError } = await import("../providers/qwen/auth-manager.mjs");
+    let client = await getOrCreateQwenClient();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await fn(client);
+      } catch (error) {
+        if (!isQwenAuthError(error) || attempt >= 1) throw error;
+        console.log("[qwen] auth error, refreshing session…");
+        const manager = await getQwenAuthManager();
+        const fresh = await manager.refresh({ forceVisible: attempt > 0 });
+        client = await buildQwenClientFromAuth(fresh);
+        qwenClient = client;
+      }
+    }
+    throw new Error("unreachable: qwenApiCall retry budget");
   }
 
   const server = http.createServer(async (req, res) => {
@@ -63,6 +102,28 @@ export async function runWindowApp({ client, workspaceRoot, port, modelType, thi
           hasAuth: p.hasAuth(),
         }));
         return sendJson(res, { providers });
+      }
+
+      // Подключить провайдера из UI (открывает окно логина в фоне).
+      const providerLoginMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/login$/);
+      if (req.method === "POST" && providerLoginMatch) {
+        const providerId = providerLoginMatch[1];
+        const { getProvider } = await import("../providers/registry.mjs");
+        const provider = getProvider(providerId);
+        if (!provider) {
+          return sendJson(res, { error: `Unknown provider: ${providerId}` }, 404);
+        }
+        try {
+          await provider.login();
+          if (providerId === "qwen") {
+            const { resetQwenBrowserProxy } = await import("../providers/qwen/browser-proxy.mjs");
+            resetQwenBrowserProxy();
+            qwenClient = null;
+          }
+          return sendJson(res, { ok: true, hasAuth: provider.hasAuth() });
+        } catch (error) {
+          return sendJson(res, { error: error.message }, 500);
+        }
       }
 
       // Загрузка файла (картинки) на DeepSeek через наш прокси.
@@ -362,13 +423,14 @@ export async function runWindowApp({ client, workspaceRoot, port, modelType, thi
 
           // Lazy-init Qwen-клиента — создаём один раз за life сервера.
           try {
-            const qwenClient = await getOrCreateQwenClient();
+            let qwenClient = await getOrCreateQwenClient();
             // Lazy createChat: на первом сообщении. Модель — из чата.
             if (!conversation.sessionId) {
-              conversation.sessionId = await qwenClient.createChat({
-                model: conversation.model || undefined,
-              });
+              conversation.sessionId = await qwenApiCall((c) =>
+                c.createChat({ model: conversation.model || undefined }),
+              );
               saveWindowState(workspaceRoot, state);
+              qwenClient = await getOrCreateQwenClient();
             }
 
             // /code-режим или Coder-mode (per-chat toggle) → запускаем code-agent.
@@ -434,14 +496,16 @@ export async function runWindowApp({ client, workspaceRoot, port, modelType, thi
               return sendJson(res, { conversation, running: true });
             }
 
-            const result = await qwenClient.complete({
-              chatId: conversation.sessionId,
-              prompt,
-              parentId: conversation.parentMessageId,
-              thinking: body.thinking === true,
-              search: body.search === true,
-              model: conversation.model || undefined,
-            });
+            const result = await qwenApiCall((c) =>
+              c.complete({
+                chatId: conversation.sessionId,
+                prompt,
+                parentId: conversation.parentMessageId,
+                thinking: body.thinking === true,
+                search: body.search === true,
+                model: conversation.model || undefined,
+              }),
+            );
             conversation.parentMessageId = result.lastMessageId ?? conversation.parentMessageId;
             const finalText = result.thinkingText
               ? `🧠 ${result.thinkingText.trim()}\n\n---\n\n${result.text.trim()}`

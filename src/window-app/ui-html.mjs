@@ -588,6 +588,43 @@ export function renderWindowHtml() {
     let newChatSelectedProvider = localStorage.getItem(PROVIDER_PICK_KEY) || "deepseek";
     let newChatSelectedMode = localStorage.getItem(NEWCHAT_MODE_KEY) || "fast";
 
+    async function connectProvider(id) {
+      const info = PROVIDER_INFO[id];
+      if (!info) return;
+      const label = info.label;
+      if (!confirm(
+        "Подключить " + label + "?\\n\\nОткроется окно браузера — залогинься на сайте. " +
+        "Окно закроется само после входа.",
+      )) return;
+      try {
+        const r = await fetch("/api/providers/" + id + "/login", { method: "POST" });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+        await refreshAvailableProviders();
+        if (availableProviders.includes(id)) {
+          newChatSelectedProvider = id;
+          localStorage.setItem(PROVIDER_PICK_KEY, id);
+          renderProviderPicker();
+          renderModePickerForProvider();
+          alert(label + " подключён.");
+        } else {
+          alert("Логин завершён, но токен не найден. Попробуй ещё раз или: npm run login-" + id);
+        }
+      } catch (e) {
+        alert("Не удалось подключить " + label + ": " + e.message);
+      }
+    }
+
+    async function refreshAvailableProviders() {
+      try {
+        const r = await fetch("/api/providers");
+        if (r.ok) {
+          const j = await r.json();
+          availableProviders = (j.providers || []).filter((p) => p.hasAuth).map((p) => p.id);
+        }
+      } catch {}
+    }
+
     function renderProviderPicker() {
       newChatProviderPicker.innerHTML = "";
       for (const id of Object.keys(PROVIDER_INFO)) {
@@ -596,17 +633,17 @@ export function renderWindowHtml() {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "providerOption " + id
-          + (id === newChatSelectedProvider ? " active" : "")
-          + (!isAuthed ? " disabled" : "");
+          + (id === newChatSelectedProvider && isAuthed ? " active" : "")
+          + (!isAuthed ? " needsAuth" : "");
         btn.dataset.provider = id;
-        btn.disabled = !isAuthed;
+        btn.dataset.authed = isAuthed ? "1" : "0";
         btn.innerHTML =
           '<div class="providerOptionTitle"></div>' +
           '<div class="providerOptionSub"></div>';
         btn.querySelector(".providerOptionTitle").textContent = info.label;
         btn.querySelector(".providerOptionSub").textContent = isAuthed
           ? info.sub
-          : info.sub + " (не подключён — npm run welcome)";
+          : info.sub + " (нажми — подключить)";
         newChatProviderPicker.appendChild(btn);
       }
     }
@@ -631,10 +668,15 @@ export function renderWindowHtml() {
       }
     }
 
-    newChatProviderPicker.addEventListener("click", (event) => {
+    newChatProviderPicker.addEventListener("click", async (event) => {
       const opt = event.target.closest(".providerOption");
-      if (!opt || opt.disabled) return;
-      newChatSelectedProvider = opt.dataset.provider;
+      if (!opt) return;
+      const id = opt.dataset.provider;
+      if (opt.dataset.authed !== "1") {
+        await connectProvider(id);
+        return;
+      }
+      newChatSelectedProvider = id;
       localStorage.setItem(PROVIDER_PICK_KEY, newChatSelectedProvider);
       renderProviderPicker();
       renderModePickerForProvider();
@@ -650,14 +692,7 @@ export function renderWindowHtml() {
 
     // На старте подтянем список доступных провайдеров и нарисуем picker'ы.
     (async () => {
-      try {
-        const r = await fetch("/api/providers");
-        if (r.ok) {
-          const j = await r.json();
-          availableProviders = (j.providers || []).filter((p) => p.hasAuth).map((p) => p.id);
-        }
-      } catch {}
-      // Если сохранённый провайдер недоступен — переключаемся на первый доступный.
+      await refreshAvailableProviders();
       if (!availableProviders.includes(newChatSelectedProvider) && availableProviders.length) {
         newChatSelectedProvider = availableProviders[0];
       }

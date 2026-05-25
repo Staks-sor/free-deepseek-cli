@@ -31,11 +31,17 @@ import { DeepSeekChatClient } from "../src/deepseek/client.mjs";
 let qwenClient = null;
 // Ленивый singleton DeepSeek-клиента — переиспользуем через все вызовы API.
 let deepseekClient = null;
-async function getQwenClient() {
+async function getQwenClient({ allowRefresh = true } = {}) {
   if (qwenClient) return qwenClient;
-  const auth = readQwenAuth(QWEN_AUTH_FILE);
+  let auth = readQwenAuth(QWEN_AUTH_FILE);
+  if (!auth?.token && allowRefresh) {
+    const { getQwenAuthManager } = await import("../src/providers/qwen/auth-manager.mjs");
+    auth = await getQwenAuthManager().refresh({ forceVisible: false });
+  }
   if (!auth?.token) {
-    throw new Error("Qwen не подключён. Запусти: npm run login-qwen");
+    throw new Error(
+      "Qwen не подключён. Запусти: npm run login-qwen (или npm run welcome)",
+    );
   }
   qwenClient = new QwenChatClient({
     token: auth.token,
@@ -197,22 +203,37 @@ ${JSON.stringify(body.tools, null, 2)}
 
   try {
     if (mapping.provider === "qwen") {
-      const client = await getQwenClient();
-      // Свежий чат на каждый запрос — простейший stateless flow.
-      const chatId = await client.createChat({ model: mapping.model, title: "API request" });
+      const runQwen = async (client) => {
+        const chatId = await client.createChat({ model: mapping.model, title: "API request" });
+        if (body.stream === true) {
+          return handleQwenStream(client, chatId, prompt, modelName, mapping.model, res);
+        }
+        const result = await client.complete({
+          chatId,
+          prompt,
+          thinking: false,
+          search: false,
+          model: mapping.model,
+        });
+        return sendJson(res, toOpenAIResponse(modelName, result.text));
+      };
 
-      if (body.stream === true) {
-        return handleQwenStream(client, chatId, prompt, modelName, mapping.model, res);
+      let client = await getQwenClient();
+      try {
+        return await runQwen(client);
+      } catch (e) {
+        const { isQwenAuthError, getQwenAuthManager } = await import("../src/providers/qwen/auth-manager.mjs");
+        if (!isQwenAuthError(e)) throw e;
+        qwenClient = null;
+        const fresh = await getQwenAuthManager().refresh({ forceVisible: false });
+        client = new QwenChatClient({
+          token: fresh.token,
+          cookieHeader: fresh.cookieHeader,
+          debug: Boolean(process.env.API_DEBUG),
+        });
+        qwenClient = client;
+        return await runQwen(client);
       }
-
-      const result = await client.complete({
-        chatId,
-        prompt,
-        thinking: false,
-        search: false,
-        model: mapping.model,
-      });
-      return sendJson(res, toOpenAIResponse(modelName, result.text));
     }
     if (mapping.provider === "deepseek") {
       const client = await getDeepSeekClient();
